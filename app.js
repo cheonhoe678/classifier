@@ -1,12 +1,58 @@
 /* 고객 한마디 분류기 — 화면.
  *
  * 흐름: 문장 → 가림(mask.js, 브라우저 안) → AI(api/classify) → 실패하면 규칙(rules.js)
- * 채점: 정답 100건을 규칙으로, 또는 AI로(20건씩 다섯 번) 돌려 맞힌 비율을 잰다.
+ * 채점: 정답 100건을 규칙으로, 또는 AI로(BATCH 건씩) 돌려 맞힌 비율을 잰다.
  */
 (function () {
   "use strict";
   const $ = s => document.querySelector(s);
-  const S = { criteria: null, test: [], practice: [], aiResults: null };
+  const S = { criteria: null, test: [], practice: [], aiResults: null, serverModel: "" };
+  const BATCH = 10;  // 채점 때 한 번에 보내는 문장 수 (서버 MAX_TEXTS 는 20)
+
+  // ── AI 모델 고르기 ──────────────────────────────────
+  // 무료 한도(하루 요청 수)는 로그인해야 보여서 순서는 «추정»이다. 가격표(2026-11)에서 «무료»로 표시된 것.
+  const MODELS = [
+    { id: "gemini-3.8-flash" },
+    { id: "gemini-3.6-flash" },
+    { id: "gemini-3.5-flash-lite" },
+    { id: "gemini-3.1-flash-lite" },
+    { id: "gemini-3-flash-preview", note: "프리뷰" },
+  ];
+  const DEFAULT_VAL = "", CUSTOM_VAL = "__custom__";
+  const store = {
+    get(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* 못 써도 앱은 돈다 */ } },
+  };
+
+  function selectedModel() {
+    const v = $("#model-sel").value;
+    return v === CUSTOM_VAL ? $("#model-custom").value.trim() : v;
+  }
+
+  function effectiveModel() { return selectedModel() || S.serverModel; }
+
+  function showModel() {
+    const m = selectedModel();
+    $("#model-custom").hidden = $("#model-sel").value !== CUSTOM_VAL;
+    $("#model-now").textContent = m ? `지금 호출 모델: ${m}`
+      : `지금 호출 모델: 서버 기본값${S.serverModel ? " — " + S.serverModel : " (확인 못 함)"}`;
+  }
+
+  function initModel() {
+    const sel = $("#model-sel");
+    sel.innerHTML = `<option value="${DEFAULT_VAL}">서버 기본값</option>`
+      + MODELS.map(m => `<option value="${m.id}">${m.id}${m.note ? " (" + m.note + ")" : ""}</option>`).join("")
+      + `<option value="${CUSTOM_VAL}">직접 입력…</option>`;
+    const saved = store.get("model"), custom = store.get("model-custom");
+    if (saved === CUSTOM_VAL) { sel.value = CUSTOM_VAL; $("#model-custom").value = custom; }
+    else if (MODELS.some(m => m.id === saved)) sel.value = saved;
+    sel.addEventListener("change", () => { store.set("model", sel.value); showModel(); });
+    $("#model-custom").addEventListener("input", e => { store.set("model-custom", e.target.value); showModel(); });
+    showModel();
+    fetch("api/classify").then(r => r.ok ? r.json() : null)
+      .then(j => { if (j && j.default) { S.serverModel = j.default; showModel(); } })
+      .catch(() => {});
+  }
 
   async function load() {
     const [c, t, p] = await Promise.all([
@@ -25,12 +71,12 @@
   }));
 
   // ── AI 호출 ─────────────────────────────────────────
-  async function askAI(maskedTexts) {
+  async function askAI(maskedTexts, model) {
     try {
       const r = await fetch("api/classify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texts: maskedTexts, criteria: S.criteria }),
+        body: JSON.stringify({ texts: maskedTexts, criteria: S.criteria, model: model === undefined ? selectedModel() : model }),
       });
       if (!r.ok) return { results: null, reason: `서버 함수가 없습니다 (${r.status}) — 배포하면 생깁니다` };
       return await r.json();
@@ -116,17 +162,25 @@
     btn.disabled = true;
     const masked = S.test.map(r => Mask.mask(r.text).masked);
     const results = [];
-    for (let i = 0; i < masked.length; i += 20) {
+    const model = selectedModel();  // 채점 도중 드롭다운을 바꿔도 한 모델로 끝까지 간다
+    let usedModel = "";
+    for (let i = 0; i < masked.length; i += BATCH) {
       btn.textContent = `AI 채점 중… ${i}/${masked.length}`;
-      const r = await askAI(masked.slice(i, i + 20));
+      let r = await askAI(masked.slice(i, i + BATCH), model);
+      if (!r.results && r.timeout) {
+        btn.textContent = `AI 채점 중… ${i}/${masked.length} · 다시 시도`;
+        r = await askAI(masked.slice(i, i + BATCH), model);
+      }
       if (!r.results) {
         $("#score-msg").hidden = false;
         $("#score-msg").textContent = `AI로 채점하지 못했습니다 — ${r.reason}`;
         btn.disabled = false; btn.textContent = "AI로 채점";
         return;
       }
+      if (r.model) usedModel = r.model;
       results.push(...r.results);
     }
+    $("#th-ai").textContent = "AI" + (usedModel || effectiveModel() ? " · " + (usedModel || effectiveModel()) : "");
     // 답을 못 받은 문장은 «오답»으로 센다 — 빠진 것을 빼고 세면 점수가 부풀려진다
     const miss = { category: "-", sentiment: "-", urgency: "-" };
     S.aiResults = results;
@@ -158,5 +212,6 @@
     $("#crit-urg").textContent = c.urgency.guide;
   }
 
+  initModel();
   load();
 })();
